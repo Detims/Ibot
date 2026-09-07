@@ -1,0 +1,226 @@
+import os
+import torch
+import torch.nn as nn
+from torch.nn import functional as F
+import time
+
+batch_size = 64
+block_size = 256
+training_time = 1 * 60 * 60
+end_time = time.time() + training_time
+eval_interval = 50
+eval_iters = 200
+learning_rate = 1e-2
+device = 'cuda' if torch.cuda.is_available() else "cpu"
+n_embd = 384
+n_head = 6
+n_layer = 6
+dropout = 0.2
+checkpoint_file = "checkpoint.pt"
+
+with open('Data/training_data.txt', "r", encoding='utf-8') as f:
+    text = f.read()
+
+# Make sorted list of text to create a vocabulary
+chars = sorted(list(set(text)))
+vocab_size = len(chars)
+
+# print("".join(chars))
+# print(vocab_size)
+
+# encoder and decoder for strings and numbers
+stoi = {ch:i for i, ch in enumerate(chars)}
+itos = {i:ch for i, ch in enumerate(chars)}
+
+encode = lambda s: [stoi[c] for c in s]
+decode = lambda l: "".join([itos[i] for i in l])
+
+# Train / val split 
+data = torch.tensor(encode(text), dtype=torch.long)
+n = int(0.9 * len(data))
+train_data = data[:n]
+val_data = data[n:]
+
+# Get batches of block_size
+def get_batch(split):
+    data = train_data if split == "train" else val_data
+    ix = torch.randint(len(data) - block_size, (batch_size,))
+    x = torch.stack([data[i:i+block_size] for i in ix])
+    y = torch.stack([data[i+1:i+block_size+1] for i in ix])
+    x, y = x.to(device), y.to(device)
+    return x, y
+
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ["train", "val"]:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            logits, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
+
+def save_checkpoint(model, optimizer, iteration, train_loss, val_loss):
+    checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "iteration": iteration,
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+    }
+
+    torch.save(checkpoint, checkpoint_file)
+
+    print(f"Saved checkpoint at iteration {iteration}.")
+
+def load_checkpoint(model, optimizer):
+    if not os.path.exists(checkpoint_file):
+        print("No checkpoint found. Starting from scratch.")
+        return 0
+
+    print("Loading checkpoitnt")
+
+    checkpoint = torch.load(checkpoint_file, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    iteration = checkpoint["iteration"]
+
+    print(f"Checkpoint loaded, starting from iteration {iteration}.")
+    print(f"Previous train loss: {checkpoint['train_loss']}, previous val loss: {checkpoint['val_loss']:.4f}")
+
+    return iteration
+
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer("tril", torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B,T,C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+
+        wei = q @ k.transpose(-2,-1) * C**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
+
+        v = self.value(x)
+        out = wei @ v
+        return out
+
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.proj = nn.Linear(num_heads * head_size, n_embd)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.dropout(self.proj(out))
+        return out
+
+class FeedFoward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        head_size = n_embd // n_head
+        self.sa = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedFoward(n_embd)
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(self.ln1(x))
+        x = x + self.ffwd(self.ln2(x))
+        return x
+
+class BigramLanguageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = nn.LayerNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size)
+
+    def forward(self, idx, targets=None):
+        B, T = idx.shape
+
+        tok_emb = self.token_embedding_table(idx)
+        pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        x = self.ln_f(x)
+        logits = self.lm_head(x)
+
+        if targets is None:
+            loss = None
+        else:
+            B, T, C = logits.shape
+            logits = logits.view(B*T, C)
+            targets = targets.view(B*T)
+            loss = F.cross_entropy(logits, targets)
+
+        return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -block_size:]
+            logits, loss = self(idx_cond)
+            logits = logits[:, -1, :]
+            probs = F.softmax(logits, dim=-1)
+            idx_next = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, idx_next), dim=1)
+        return idx
+
+if __name__ == "__main__":
+
+    model = BigramLanguageModel()
+    m = model.to(device)
+    iter = 0
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+
+    iter = load_checkpoint(model, optimizer)
+
+    while time.time() < end_time:
+
+        if iter % eval_interval == 0:
+            losses = estimate_loss()
+            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, time remaining: {int(end_time - time.time())} seconds")
+            save_checkpoint(model, optimizer, iter, losses["train"], losses["val"])
+
+        xb, yb = get_batch("train")
+
+        logits, loss = model(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        optimizer.step()
+
+        iter += 1
+
+    print("Training time reached, saving.")
+    print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}, time remaining: {int(end_time - time.time())} seconds")
+    save_checkpoint(model, optimizer, iter, losses["train"], losses["val"])
