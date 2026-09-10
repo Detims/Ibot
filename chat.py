@@ -23,15 +23,15 @@ if __name__ == "__main__":
 
     while True:
 
-        user_input = input("<user> ")
+        user_input = input("<ongthee> ")
 
         if user_input.lower() == "exit":
             break
 
-        conversation += f"<user> {user_input}\n"
+        conversation += f"<ongthee> {user_input}\n"
 
         with open(history, "a", encoding="utf-8") as f:
-            f.write(f"<user> {user_input}\n")
+            f.write(f"<ongthee> {user_input}\n")
 
         context = torch.tensor([encode(conversation)],dtype=torch.long,device=device)
 
@@ -41,10 +41,10 @@ if __name__ == "__main__":
 
         response = generated[len(conversation):]
 
-        if not (response.startswith("<user>")):
+        if not (response.startswith("<ongthee>")):
 
-            if "<user>" in response:
-                response = response.split("<user>")[0].strip()
+            if "<ongthee>" in response:
+                response = response.split("<ongthee>")[0].strip()
 
             print(response.lstrip())
 
